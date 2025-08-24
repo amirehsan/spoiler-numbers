@@ -9,10 +9,9 @@ const pool = new Pool({
   ssl: {
     rejectUnauthorized: false
   },
-  // Aggressive settings for Vercel/Neon to ensure connection stability
-  idleTimeoutMillis: 5000,
-  connectionTimeoutMillis: 20000,
-  max: 1,
+  // New settings for serverless environments
+  idleTimeoutMillis: 20000, // Close idle clients after 20 seconds
+  connectionTimeoutMillis: 10000, // Return an error after 10 seconds if connection could not be established
 });
 
 bot.onText(/\/start/, async (msg) => {
