@@ -4,7 +4,15 @@ export async function POST(request) {
   try {
     const body = await request.json();
 
-    // Process update in background - don't wait for completion
+    // Respond to Telegram IMMEDIATELY
+    const response = new Response(JSON.stringify({ message: 'ok' }), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+
+    // Process update after response (non-blocking)
     setImmediate(() => {
       try {
         bot.processUpdate(body);
@@ -13,17 +21,11 @@ export async function POST(request) {
       }
     });
 
-    // Respond immediately to Telegram
-    return new Response(JSON.stringify({ message: 'ok' }), {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    });
+    return response;
   } catch (error) {
     console.error('Webhook error:', error);
-    return new Response(JSON.stringify({ message: 'error' }), {
-      status: 500,
+    return new Response(JSON.stringify({ message: 'ok' }), {
+      status: 200,
       headers: {
         'Content-Type': 'application/json',
       },
@@ -31,5 +33,4 @@ export async function POST(request) {
   }
 }
 
-// Add timeout handling
-export const maxDuration = 30; // Vercel timeout limit
+export const maxDuration = 10; // Reduce timeout to 10 seconds
