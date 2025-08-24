@@ -3,17 +3,7 @@ import { bot } from '../../../lib/bot';
 export async function POST(request) {
   try {
     const body = await request.json();
-
-    // Process update in background - don't wait for completion
-    setImmediate(() => {
-      try {
-        bot.processUpdate(body);
-      } catch (processErr) {
-        console.error('Error processing update:', processErr);
-      }
-    });
-
-    // Respond immediately to Telegram
+    bot.processUpdate(body);
     return new Response(JSON.stringify({ message: 'ok' }), {
       status: 200,
       headers: {
@@ -21,7 +11,7 @@ export async function POST(request) {
       },
     });
   } catch (error) {
-    console.error('Webhook error:', error);
+    console.error(error);
     return new Response(JSON.stringify({ message: 'error' }), {
       status: 500,
       headers: {
@@ -30,6 +20,3 @@ export async function POST(request) {
     });
   }
 }
-
-// Add timeout handling
-export const maxDuration = 30; // Vercel timeout limit
