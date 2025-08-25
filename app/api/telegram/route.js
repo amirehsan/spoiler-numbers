@@ -26,25 +26,27 @@ export async function POST(request) {
         });
         console.log('✅ Welcome message sent');
 
-        // Handle user registration in background
-        setImmediate(async () => {
-          let client;
-          try {
-            client = await pool.connect();
-            const res = await client.query('SELECT * FROM users WHERE telegram_id = $1', [id]);
-            if (res.rows.length === 0) {
-              await client.query(
-                'INSERT INTO users (telegram_id, username, first_name, last_name) VALUES ($1, $2, $3, $4)',
-                [id, username, first_name, last_name]
-              );
-              console.log('✅ User registered in database');
-            }
-          } catch (err) {
-            console.error('❌ Database error:', err);
-          } finally {
-            if (client) client.release();
+        // Register user synchronously (but quickly)
+        let client;
+        try {
+          client = await Promise.race([
+            pool.connect(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('DB timeout')), 3000))
+          ]);
+
+          const res = await client.query('SELECT * FROM users WHERE telegram_id = $1', [id]);
+          if (res.rows.length === 0) {
+            await client.query(
+              'INSERT INTO users (telegram_id, username, first_name, last_name) VALUES ($1, $2, $3, $4)',
+              [id, username, first_name, last_name]
+            );
+            console.log('✅ User registered in database');
           }
-        });
+        } catch (err) {
+          console.error('❌ User registration error:', err);
+        } finally {
+          if (client) client.release();
+        }
 
       } catch (botError) {
         console.error('❌ Error sending welcome message:', botError);
@@ -91,54 +93,98 @@ export async function POST(request) {
           const number = parseInt(numberStr, 10);
           const status = action === 'check' ? 'checked' : 'not-checked';
 
-          // Update UI immediately
-          await bot.editMessageText(`You marked **${number}** as _${status}_.`, {
-            chat_id: chatId,
-            message_id: messageId,
-            parse_mode: 'Markdown'
-          });
-          console.log('✅ UI updated for number:', number, 'status:', status);
+          console.log('📊 Action details:', { userId, number, status, action });
 
-          // Save to database in background
-          setImmediate(async () => {
-            let client;
-            try {
-              client = await pool.connect();
+          // Database operations FIRST (synchronously)
+          let client;
+          let dbSuccess = false;
 
-              // Find or create user
-              let userRes = await client.query('SELECT id FROM users WHERE telegram_id = $1', [userId]);
+          try {
+            console.log('🔗 Getting database connection...');
+            client = await Promise.race([
+              pool.connect(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Connection timeout')), 5000))
+            ]);
+            console.log('✅ Database connected');
 
-              if (userRes.rows.length === 0) {
-                await client.query(
-                  'INSERT INTO users (telegram_id, username, first_name, last_name) VALUES ($1, $2, $3, $4)',
-                  [userId, callbackQuery.from.username, callbackQuery.from.first_name, callbackQuery.from.last_name]
-                );
-                userRes = await client.query('SELECT id FROM users WHERE telegram_id = $1', [userId]);
-              }
+            // Start explicit transaction
+            await client.query('BEGIN');
+            console.log('🔄 Transaction started');
 
-              if (userRes.rows.length > 0) {
-                const userDbId = userRes.rows[0].id;
-                await client.query('BEGIN');
-                await client.query(
-                  'INSERT INTO random_numbers (user_id, number, status) VALUES ($1, $2, $3)',
-                  [userDbId, number, status]
-                );
-                await client.query('COMMIT');
-                console.log('✅ Saved to database:', { userId, number, status });
-              }
-            } catch (dbErr) {
-              console.error('❌ Database save error:', dbErr);
-              if (client) {
-                try {
-                  await client.query('ROLLBACK');
-                } catch (rollbackErr) {
-                  console.error('❌ Rollback error:', rollbackErr);
-                }
-              }
-            } finally {
-              if (client) client.release();
+            // Find or create user
+            let userRes = await client.query('SELECT id FROM users WHERE telegram_id = $1', [userId]);
+            console.log('👤 User lookup result:', userRes.rows.length > 0 ? `Found ID: ${userRes.rows[0]?.id}` : 'Not found');
+
+            if (userRes.rows.length === 0) {
+              console.log('👤 Creating new user...');
+              await client.query(
+                'INSERT INTO users (telegram_id, username, first_name, last_name) VALUES ($1, $2, $3, $4)',
+                [userId, callbackQuery.from.username, callbackQuery.from.first_name, callbackQuery.from.last_name]
+              );
+              userRes = await client.query('SELECT id FROM users WHERE telegram_id = $1', [userId]);
+              console.log('✅ User created with ID:', userRes.rows[0]?.id);
             }
-          });
+
+            if (userRes.rows.length > 0) {
+              const userDbId = userRes.rows[0].id;
+              console.log('💾 Inserting record:', { userDbId, number, status });
+
+              const insertResult = await client.query(
+                'INSERT INTO random_numbers (user_id, number, status) VALUES ($1, $2, $3) RETURNING *',
+                [userDbId, number, status]
+              );
+
+              console.log('✅ Record inserted:', insertResult.rows[0]);
+
+              // Commit transaction
+              await client.query('COMMIT');
+              console.log('✅ Transaction committed successfully');
+              dbSuccess = true;
+
+              // Verify the insert
+              const verifyResult = await client.query(
+                'SELECT * FROM random_numbers WHERE user_id = $1 AND number = $2 AND status = $3 ORDER BY created_at DESC LIMIT 1',
+                [userDbId, number, status]
+              );
+              console.log('🔍 Verification query result:', verifyResult.rows[0]);
+
+            } else {
+              await client.query('ROLLBACK');
+              console.log('❌ No user found, transaction rolled back');
+            }
+
+          } catch (dbErr) {
+            console.error('❌ Database error:', dbErr);
+            if (client) {
+              try {
+                await client.query('ROLLBACK');
+                console.log('🔄 Transaction rolled back due to error');
+              } catch (rollbackErr) {
+                console.error('❌ Rollback error:', rollbackErr);
+              }
+            }
+          } finally {
+            if (client) {
+              client.release();
+              console.log('🔌 Database connection released');
+            }
+          }
+
+          // Update UI after database operation
+          try {
+            const message = dbSuccess
+              ? `You marked **${number}** as _${status}_. ✅ Saved to database!`
+              : `You marked **${number}** as _${status}_. ❌ Database save failed.`;
+
+            await bot.editMessageText(message, {
+              chat_id: chatId,
+              message_id: messageId,
+              parse_mode: 'Markdown'
+            });
+            console.log('✅ UI updated with database status');
+          } catch (uiError) {
+            console.error('❌ UI update error:', uiError);
+          }
         }
 
       } catch (callbackError) {
@@ -175,4 +221,4 @@ export async function POST(request) {
   }
 }
 
-export const maxDuration = 10;
+export const maxDuration = 15;

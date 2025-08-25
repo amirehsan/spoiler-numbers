@@ -1,18 +1,29 @@
-import { Pool } from 'pg';
+import pool from '../../lib/db'; // Use centralized pool
 import { StatusPieChart, NumberFrequencyBarChart } from './charts';
 
+// Force dynamic rendering - no caching
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+export const fetchCache = 'force-no-store';
+export const runtime = 'nodejs';
+
 async function getData() {
-  const pool = new Pool({
-    connectionString: process.env.POSTGRES_URL,
-    ssl: {
-      rejectUnauthorized: false
-    }
-  });
+  if (!pool) {
+    return {
+      recentActivity: [],
+      stats: { total_users: 0, total_numbers: 0, checked_numbers: 0, not_checked_numbers: 0 },
+      barChartData: [],
+    };
+  }
 
-  const client = await pool.connect();
-
+  let client;
   try {
-    // Query for recent activity
+    client = await pool.connect();
+
+    // Force read from primary (avoid read replicas)
+    await client.query('SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE');
+
+    // Query for recent activity with explicit ordering
     const recentActivityQuery = client.query(`
       SELECT
         u.telegram_id,
@@ -29,7 +40,7 @@ async function getData() {
       LIMIT 100;
     `);
 
-    // Query for statistics
+    // Query for statistics with explicit counting
     const statsQuery = client.query(`
         SELECT
             (SELECT COUNT(*) FROM users) AS total_users,
@@ -47,28 +58,29 @@ async function getData() {
         ORDER BY number ASC;
     `);
 
-    // Await all promises in parallel
-    const [recentActivityResult, statsResult, barChartResult] = await Promise.all([recentActivityQuery, statsQuery, barChartQuery]);
+    // Wait for all queries
+    const [recentActivityResult, statsResult, barChartResult] = await Promise.all([
+      recentActivityQuery,
+      statsQuery,
+      barChartQuery
+    ]);
 
     return {
       recentActivity: recentActivityResult.rows,
-      stats: statsResult.rows[0],
+      stats: statsResult.rows[0] || { total_users: 0, total_numbers: 0, checked_numbers: 0, not_checked_numbers: 0 },
       barChartData: barChartResult.rows,
     };
   } catch (error) {
-    console.error('Error fetching data:', error);
-    // Return a default structure in case of error
+    console.error('Error fetching dashboard data:', error);
     return {
       recentActivity: [],
       stats: { total_users: 0, total_numbers: 0, checked_numbers: 0, not_checked_numbers: 0 },
       barChartData: [],
     };
-  }
-  finally {
-    client.release();
+  } finally {
+    if (client) client.release();
   }
 }
-
 
 export default async function Dashboard() {
   const { recentActivity, stats, barChartData } = await getData();
@@ -82,6 +94,9 @@ export default async function Dashboard() {
       <main className="container mx-auto p-4 sm:p-6 lg:p-8">
         <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-8">
           <h1 className="text-3xl font-bold tracking-tight text-white">TeleBot Dashboard</h1>
+          <div className="text-sm text-gray-400 mt-2 sm:mt-0">
+            Last updated: {new Date().toLocaleTimeString()}
+          </div>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
@@ -95,11 +110,11 @@ export default async function Dashboard() {
             </div>
             <div className="bg-gray-800 p-6 rounded-lg">
                 <h2 className="text-lg font-medium text-gray-400">Checked</h2>
-                <p className="text-3xl font-bold">{String(stats.checked_numbers)}</p>
+                <p className="text-3xl font-bold text-green-400">{String(stats.checked_numbers)}</p>
             </div>
             <div className="bg-gray-800 p-6 rounded-lg">
                 <h2 className="text-lg font-medium text-gray-400">Not-Checked</h2>
-                <p className="text-3xl font-bold">{String(stats.not_checked_numbers)}</p>
+                <p className="text-3xl font-bold text-red-400">{String(stats.not_checked_numbers)}</p>
             </div>
         </div>
 
@@ -109,41 +124,61 @@ export default async function Dashboard() {
                 <StatusPieChart data={pieChartData} />
             </div>
             <div className="lg:col-span-2 bg-gray-800 p-6 rounded-lg">
-                <h2 className="text-xl font-bold mb-4">Checked Number Frequency</h2>
+                <h2 className="text-xl font-bold mb-4">Number Frequency</h2>
                 <NumberFrequencyBarChart data={barChartData} />
             </div>
         </div>
 
-        <div className="bg-gray-800 rounded-lg shadow overflow-hidden">
-            <h2 className="text-xl font-bold p-6">Recent Activity</h2>
+        <div className="bg-gray-800 rounded-lg overflow-hidden">
+            <div className="px-6 py-4 border-b border-gray-700">
+                <h2 className="text-xl font-bold">Recent Activity</h2>
+            </div>
             <div className="overflow-x-auto">
-                <table className="min-w-full">
+                <table className="w-full">
                     <thead className="bg-gray-700">
                         <tr>
-                            <th className="text-left py-3 px-6 font-semibold">User</th>
-                            <th className="text-left py-3 px-6 font-semibold">Number</th>
-                            <th className="text-left py-3 px-6 font-semibold">Status</th>
-                            <th className="text-left py-3 px-6 font-semibold">Timestamp</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">User</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Number</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Status</th>
+                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Date</th>
                         </tr>
                     </thead>
                     <tbody className="divide-y divide-gray-700">
-                        {recentActivity.map((row, index) => (
-                            <tr key={index} className="hover:bg-gray-700/50">
-                                <td className="py-4 px-6">
-                                    <div className="font-medium">{row.first_name || 'N/A'} {row.last_name || ''}</div>
-                                    <div className="text-sm text-gray-400">@{row.username || 'N/A'}</div>
+                        {recentActivity.length === 0 ? (
+                            <tr>
+                                <td colSpan={4} className="px-6 py-4 text-center text-gray-400">
+                                    No activity yet. Try using the bot!
                                 </td>
-                                <td className="py-4 px-6 font-mono text-lg">{row.number}</td>
-                                <td className="py-4 px-6">
-                                    <span className={`px-3 py-1 rounded-full text-sm font-semibold ${
-                                        row.status === 'checked' ? 'bg-green-500/20 text-green-300' : 'bg-red-500/20 text-red-300'
-                                    }`}>
-                                        {row.status}
-                                    </span>
-                                </td>
-                                <td className="py-4 px-6 text-gray-400">{new Date(row.created_at).toLocaleString()}</td>
                             </tr>
-                        ))}
+                        ) : (
+                            recentActivity.map((activity, index) => (
+                                <tr key={index} className="hover:bg-gray-700">
+                                    <td className="px-6 py-4 whitespace-nowrap">
+                                        <div>
+                                            <div className="text-sm font-medium text-white">
+                                                {activity.first_name} {activity.last_name}
+                                            </div>
+                                            <div className="text-sm text-gray-400">@{activity.username}</div>
+                                        </div>
+                                    </td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-white">
+                                        {activity.number}
+                                    </td>
+                                    <td className="px-6 py-4 whitespace-nowrap">
+                                        <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                                            activity.status === 'checked'
+                                                ? 'bg-green-100 text-green-800'
+                                                : 'bg-red-100 text-red-800'
+                                        }`}>
+                                            {activity.status}
+                                        </span>
+                                    </td>
+                                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-400">
+                                        {new Date(activity.created_at).toLocaleString()}
+                                    </td>
+                                </tr>
+                            ))
+                        )}
                     </tbody>
                 </table>
             </div>
